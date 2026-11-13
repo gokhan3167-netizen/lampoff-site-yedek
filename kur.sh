@@ -13,6 +13,8 @@ SM=$(git -C "$T/main" rev-parse --short HEAD); SD=$(git -C "$T/deneme" rev-parse
 for b in main deneme; do rm -rf "$T/$b/.git" "$T/$b/.github" "$T/$b/CNAME"; done
 cp -a "$T/main/." "$OUT/"
 cp -a "$T/deneme/." "$OUT/deneme/"
+# ozel/<gizli-ad>/ = yalnız Melis + Gökhan için web uygulaması (linki bilen girer; bağlantı hiçbir sayfada yok). Kaynak: lampoff_android/www, kod karıştırılmış.
+[ -d ozel ] && cp -a ozel/. "$OUT/"
 python3 - "$OUT" "$BASE" <<'PY'
 import os,re,sys
 out,base=sys.argv[1],sys.argv[2]
