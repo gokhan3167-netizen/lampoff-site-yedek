@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>LampOff WebGPU deneme</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#eee;font:14px/1.35 -apple-system,system-ui,sans-serif;overflow:hidden}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+#ui{position:fixed;left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;gap:6px;justify-content:center;pointer-events:none}
+#ui button{pointer-events:auto;border:1px solid #444;background:rgba(20,20,22,.82);color:#eee;border-radius:10px;padding:8px 12px;font:600 13px system-ui;cursor:pointer}
+#ui button.on{background:#F28C28;border-color:#F28C28;color:#111}
+#st{position:fixed;left:10px;top:calc(10px + env(safe-area-inset-top));background:rgba(20,20,22,.8);border:1px solid #333;border-radius:10px;padding:7px 10px;font-size:12px}
+#st b{color:#F28C28}
+</style>
+<script type="importmap">
+{"imports":{"three":"./lib/three.webgpu.min.js","three/webgpu":"./lib/three.webgpu.min.js","three/tsl":"./lib/three.tsl.min.js","three/addons/":"./lib/addons/"}}
+</script>
+</head>
+<body>
+<div id="st">Yükleniyor…</div>
+<div id="ui"></div>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import { pass, uniform, screenUV, Fn, vec3, float, hash, screenCoordinate, positionWorld, time, mx_noise_float } from 'three/tsl';
+import { OrbitControls } from 'three/addons/OrbitControls.js';
+import { bloom } from 'three/addons/BloomNode.js';
+import { gaussianBlur } from 'three/addons/GaussianBlurNode.js';
+
+const P = await (await fetch('demo.json')).json();
+const st = document.getElementById('st');
+const isPhone = matchMedia('(max-width:900px)').matches || /iPhone|Android/i.test(navigator.userAgent);
+
+const Q = new URLSearchParams(location.search);
+const renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: Q.has('gl') });
+renderer.setPixelRatio(Math.min(devicePixelRatio, isPhone ? 1.5 : 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+await renderer.init();
+const gpu = !!(renderer.backend && renderer.backend.isWebGPUBackend);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x020203);
+const camera = new THREE.PerspectiveCamera(isPhone ? 62 : 48, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, 4.2, 21);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 4.0, 4.5);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.update();
+
+// ---- layers: volumetric fog only lit by chosen lights
+const LV = 10;
+const volLayer = new THREE.Layers(); volLayer.disableAll(); volLayer.enable(LV);
+
+// ---- materials
+const mat = (c, r = 0.85, m = 0) => new THREE.MeshStandardNodeMaterial({ color: c, roughness: r, metalness: m });
+const mFloor = mat(0x2a2522, 0.9), mStage = mat(0x161412, 0.75), mTruss = mat(0x9a9da2, 0.45, 0.6), mBlack = mat(0x0c0c0d, 0.6), mSeat = mat(0x4a1012, 0.9);
+const box = (w, h, d, m, x, y, z, cast = true) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); o.castShadow = cast; o.receiveShadow = true; scene.add(o); return o; };
+
+const SW = P.stage.w, SD = P.stage.d, DECK = 1.0; // sahne yüksekliği 1 m
+// zemin + sahne
+box(60, 0.1, 60, mFloor, 0, -0.05, 10, false);
+box(SW + 1, DECK, SD + 0.3, mStage, 0, DECK / 2, SD / 2, false);
+// fon perdesi
+box(SW + 2, 9, 0.12, mat(0x15151a, 0.95), 0, 4.5, 0.25, false);
+
+// ---- trusses
+const tr = (x1, y1, z1, x2, y2, z2) => { const a = new THREE.Vector3(x1, y1, z1), b = new THREE.Vector3(x2, y2, z2), L = a.distanceTo(b); const o = new THREE.Mesh(new THREE.BoxGeometry(0.29, 0.29, L), mTruss); o.position.copy(a).lerp(b, 0.5); o.lookAt(b); o.castShadow = true; scene.add(o); };
+const pipeH = p => p.orient === 'z' ? 0 : (+p.h || 6);
+for (const p of P.pipes) {
+  const h = pipeH(p) + DECK * 0;
+  if (p.orient === 'h') { tr(p.x - p.len / 2, h, p.y, p.x + p.len / 2, h, p.y); if (p.y < SD + 0.5) { tr(p.x - p.len / 2, 0, p.y, p.x - p.len / 2, h, p.y); tr(p.x + p.len / 2, 0, p.y, p.x + p.len / 2, h, p.y); } }
+  else if (p.orient === 'v') { tr(p.x, h, p.y - p.len / 2, p.x, h, p.y + p.len / 2); tr(p.x, 0, p.y - p.len / 2, p.x, h, p.y - p.len / 2); tr(p.x, 0, p.y + p.len / 2, p.x, h, p.y + p.len / 2); }
+  else { tr(p.x, 0, p.y, p.x, p.len, p.y); }
+}
+
+// ---- dekor
+const objs = { ledekran: [4, 2.5, 0.15, 0x050510], prak60: [2, 0.6, 1, 0x1b1b1b], davul: [1.6, 1.0, 1.4, 0x6a1010], kpiyano: [1.5, 1.0, 1.9, 0x070707], synth: [1.3, 0.95, 0.4, 0x111111], amfi: [0.7, 0.6, 0.35, 0x151515], monitor: [0.6, 0.35, 0.45, 0x111111], mikrofon: [0.05, 1.5, 0.05, 0x222222], mikser: [2, 1, 1, 0x1a1a1a] };
+let led = null;
+for (const s of P.shapes) {
+  if (s.type === 'obj' && objs[s.lib]) {
+    const [w, h, d, c] = objs[s.lib]; const onStage = s.y1 < SD + 0.2; const base = onStage ? DECK : 0;
+    const riser = s.lib !== 'prak60' && Math.abs(s.x1) < 1.1 && s.y1 > 2 && s.y1 < 4.3 ? 0.6 : 0;
+    const o = box(w, h, d, s.lib === 'ledekran' ? new THREE.MeshStandardNodeMaterial({ color: 0x000000, emissive: 0x1a2a66, emissiveIntensity: 0.5 }) : mat(c, 0.6), s.x1, base + riser + h / 2 + (s.lib === 'ledekran' ? 1.6 : 0), s.y1);
+    if (s.lib === 'ledekran') led = o;
+  } else if (s.type === 'person') {
+    const g = new THREE.Group(); const col = s.c || '#3A86FF'; const skin = mat(0xe3bb9a, 0.7);
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.2, 0.75, 6, 12), mat(col, 0.65)); body.position.y = 1.1;
+    const legs = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.7, 6, 12), mat(0x1c1f26, 0.8)); legs.position.y = 0.45;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.13, 20, 14), skin); head.position.y = 1.72;
+    [body, legs, head].forEach(o => { o.castShadow = true; o.receiveShadow = true; g.add(o); });
+    const riser = Math.abs(s.x1) < 1.1 && s.y1 > 2 && s.y1 < 4.3 ? 0.6 : 0;
+    g.position.set(s.x1, DECK + riser, s.y1); if (s.pose === 'sit') g.scale.y = 0.8; scene.add(g);
+  } else if (s.type === 'rect' && /PA/.test(s.t || '')) {
+    box(Math.abs(s.x2 - s.x1), 2.5, Math.abs(s.y2 - s.y1), mBlack, (s.x1 + s.x2) / 2, 1.25, (s.y1 + s.y2) / 2);
+  }
+}
+// seyirci koltukları (instanced)
+{
+  const g = new THREE.BoxGeometry(0.5, 0.9, 0.5); const rows = 16, cols = 30; const im = new THREE.InstancedMesh(g, mSeat, rows * cols); let i = 0; const M = new THREE.Matrix4();
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const x = -8.4 + c * 0.58 + (c >= 15 ? 0.9 : 0); M.makeTranslation(x - 0.45, 0.45 + r * 0.12, SD + 2.2 + r * 0.95); im.setMatrixAt(i++, M); }
+  im.receiveShadow = true; scene.add(im);
+}
+
+scene.add(new THREE.HemisphereLight(0x8090b0, 0x100c08, 0.35));
+
+// ---- gobo dokuları
+function goboTex(kind) {
+  const c = document.createElement('canvas'); c.width = c.height = 256; const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, 256, 256); g.save(); g.beginPath(); g.arc(128, 128, 124, 0, 7); g.clip(); g.fillStyle = '#fff';
+  if (kind === 1) { for (let a = 0; a < 6; a++) { g.save(); g.translate(128, 128); g.rotate(a * Math.PI / 3); g.beginPath(); g.ellipse(0, -62, 24, 54, 0, 0, 7); g.fill(); g.restore(); } g.beginPath(); g.arc(128, 128, 20, 0, 7); g.fill(); }
+  else if (kind === 2) { let s = 7; const rnd = () => (s = (s * 9301 + 49297) % 233280) / 233280; for (let i = 0; i < 26; i++) { g.beginPath(); g.ellipse(rnd() * 256, rnd() * 256, 8 + rnd() * 26, 6 + rnd() * 18, rnd() * 3, 0, 7); g.fill(); } }
+  else { for (let r = 0; r < 4; r++) for (let a = 0; a < (r ? r * 7 : 1); a++) { const t = a / (r ? r * 7 : 1) * 6.283; g.beginPath(); g.arc(128 + Math.cos(t) * r * 34, 128 + Math.sin(t) * r * 34, 11, 0, 7); g.fill(); } }
+  g.restore(); const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const GOBO = [null, goboTex(1), goboTex(2), goboTex(3)];
+
+// ---- fixtures → spot lights
+const baseBeam = { wash: 24, spot: 18, beam: 3.5, par: 26, bar: 60, strobe: 90, hazer: 0, profile: 24, fresnel: 40, pc: 30, par64: 14, blinder: 55, follow: 7, projector: 0 };
+const power = { wash: 900, spot: 1300, beam: 2600, par: 300, bar: 120, strobe: 600, profile: 700, fresnel: 500, pc: 500, par64: 600, blinder: 700, follow: 2600 };
+const pipeOf = f => P.pipes.find(p => p.orient === 'h' ? Math.abs(p.y - f.y) < 0.05 && Math.abs(f.x - p.x) <= p.len / 2 + 0.05 : p.orient === 'v' ? Math.abs(p.x - f.x) < 0.05 && Math.abs(f.y - p.y) <= p.len / 2 + 0.05 : Math.abs(p.x - f.x) < 0.05 && Math.abs(p.y - f.y) < 0.05);
+const FX = [];
+const fxBody = new THREE.CylinderGeometry(0.13, 0.17, 0.42, 14);
+for (const f of P.fixtures) {
+  if (!power[f.type]) continue;
+  const p = pipeOf(f); let h;
+  if (p && p.orient === 'z') h = +f.z || 1.5; else if (p) h = pipeH(p) - 0.35; else h = f.type === 'follow' ? 2.4 : (f.y < SD ? DECK + 0.15 : 0.3);
+  const pos = new THREE.Vector3(f.x, h, f.y);
+  const body = new THREE.Mesh(fxBody, mBlack); body.position.copy(pos); body.castShadow = false; scene.add(body);
+  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.12, 18), new THREE.MeshBasicNodeMaterial({ color: 0x000000 })); scene.add(lens);
+  const L = new THREE.SpotLight(0xffffff, 0, 60, 0.3, 0.45, 2); L.position.copy(pos); scene.add(L); scene.add(L.target);
+  FX.push({ f, pos, L, body, lens, h });
+}
+// gölge: en önemli ışıklar (spot, beam, takip, FOH 2'si)
+const shadowList = FX.filter(o => ['spot', 'beam', 'follow'].includes(o.f.type)).concat(FX.filter(o => o.f.type === 'profile').slice(2, 4));
+shadowList.forEach(o => { o.L.castShadow = true; o.L.shadow.mapSize.set(isPhone ? 256 : 512, isPhone ? 256 : 512); o.L.shadow.camera.near = 0.5; o.L.shadow.bias = -0.0005; });
+
+const hex = c => new THREE.Color(c || '#ffffff');
+function applyCue(ix) {
+  const cue = P.cues[ix], d = cue ? cue.data : {};
+  for (const o of FX) {
+    const f = o.f, s = d[f.id] || null, I = s ? s.I : 0;
+    // yön: focus (konvansiyonel) ya da rot+pan/tilt (hareketli)
+    const tgt = new THREE.Vector3();
+    const mover = ['wash', 'spot', 'beam'].includes(f.type);
+    const floorY = (f.focus && f.focus.y < SD) || (!f.focus && f.y < SD) ? DECK : 0;
+    if (!mover && f.focus) tgt.set(f.focus.x, floorY + 1.2, f.focus.y);
+    else if (!mover && ['bar', 'par'].includes(f.type) && o.h < 3) { const r = (f.rot || 0) * Math.PI / 180; tgt.set(f.x - Math.sin(r) * 3, o.h + 3, f.y + Math.cos(r) * 3); }
+    else { const r = ((f.rot || 0) + (s ? s.pan || 0 : 0)) * Math.PI / 180, tl = Math.max(-80, Math.min(80, s ? s.tilt || 0 : 0)) * Math.PI / 180, hh = o.h - DECK, rr = hh * Math.tan(tl); tgt.set(f.x - Math.sin(r) * rr, DECK, f.y + Math.cos(r) * rr); }
+    o.L.target.position.copy(tgt); o.L.target.updateMatrixWorld();
+    const dir = tgt.clone().sub(o.pos).normalize();
+    o.body.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
+    o.lens.position.copy(o.pos).addScaledVector(dir, 0.22); o.lens.lookAt(o.pos.clone().addScaledVector(dir, 2));
+    let ang = f.beamLib || f.beam || baseBeam[f.type] || 25; if (s && s.zoom != null && mover) ang *= 0.35 + 1.3 * s.zoom;
+    o.L.angle = Math.min(1.45, ang * Math.PI / 360 * 1.15);
+    o.L.penumbra = f.type === 'beam' ? 0.1 : ['profile', 'follow', 'spot'].includes(f.type) ? 0.25 : 0.6;
+    const useGel = !mover && !['par', 'bar', 'strobe'].includes(f.type);
+    const c = useGel ? hex(f.gel ? f.gel.h : '#FFE2B8') : hex(s ? s.col : '#ffffff');
+    o.L.color.copy(c);
+    o.L.intensity = I * power[f.type] * (s && s.strobe ? 0.7 : 1);
+    o.L.visible = I > 0.01;
+    const inVol = o.L.visible && (Q.get('vt') ? Q.get('vt').split(',') : isPhone ? ['spot', 'beam', 'follow'] : ['spot', 'beam', 'follow', 'wash', 'profile']).includes(f.type) && !(f.type === 'wash' && o.h < 7.5 && f.y > 7);
+    inVol ? o.L.layers.enable(LV) : o.L.layers.disable(LV);
+    o.L.map = f.type === 'spot' && s && s.gobo ? GOBO[((s.gobo - 1) % 3) + 1] : null;
+    if (o.L.map && !o.L.castShadow) { o.L.castShadow = true; o.L.shadow.mapSize.set(256, 256); }
+    o.lens.material.color.copy(I > 0.01 ? c.clone().multiplyScalar(1.5 + 3 * I) : new THREE.Color(0x050505));
+  }
+  if (led) led.material.emissiveIntensity = ix === 3 ? 1.2 : 0.6;
+  document.querySelectorAll('#ui [data-c]').forEach(b => b.classList.toggle('on', +b.dataset.c === ix));
+}
+
+// ---- sis hacmi
+const fogDensity = uniform(+(Q.get('fog') || 0.8));
+const volMat = new THREE.VolumeNodeMaterial();
+volMat.steps = +(Q.get('steps') || (isPhone ? 12 : 22));
+volMat.offsetNode = hash(screenCoordinate.xy); // titreşimle bantlanmayı azalt
+volMat.scatteringNode = Fn(({ positionRay }) => {
+  const n = mx_noise_float(positionRay.mul(0.35).add(vec3(time.mul(0.05), 0, time.mul(0.03)))).mul(0.5).add(0.75);
+  const fade = positionRay.y.mul(-0.06).add(1.0).clamp(0.3, 1.0);
+  return fogDensity.mul(n).mul(fade);
+});
+const vol = new THREE.Mesh(new THREE.BoxGeometry(26, 11, 22), volMat);
+vol.position.set(0, 5.5, 8); vol.receiveShadow = true; vol.layers.disableAll(); vol.layers.enable(LV); if (!Q.has('novol')) scene.add(vol);
+
+// ---- post: sahne + hacim (çeyrek çözünürlük, bulanık) + parlama
+const post = new THREE.PostProcessing(renderer);
+const scenePass = pass(scene, camera);
+const depth = scenePass.getTextureNode('depth');
+volMat.depthNode = depth.sample(screenUV);
+const volPass = pass(scene, camera, { depthBuffer: false });
+volPass.setLayers(volLayer);
+volPass.setResolution(isPhone ? 0.25 : 0.4);
+const volI = uniform(1.0), bloomOn = uniform(1.0);
+const volBlur = gaussianBlur(volPass, 0.6);
+const withVol = Q.has('novol') ? scenePass : scenePass.add(volBlur.mul(volI));
+const bl = bloom(withVol, 0.55, 0.45, 0.35);
+post.outputNode = withVol.add(bl.mul(bloomOn));
+
+// ---- UI
+const ui = document.getElementById('ui');
+P.cues.forEach((c, i) => { const b = document.createElement('button'); b.dataset.c = i; b.textContent = c.n + ' · ' + c.name; b.onclick = () => applyCue(i); ui.appendChild(b); });
+const tog = (label, u, on = true) => { const b = document.createElement('button'); b.textContent = label; b.classList.toggle('on', on); b.onclick = () => { const v = u.value > 0 ? 0 : 1; u.value = v; b.classList.toggle('on', !!v); }; ui.appendChild(b); };
+tog('Hacimli ışık', volI); tog('Parlama', bloomOn);
+st.innerHTML = 'Çizim: <b>' + (gpu ? 'WebGPU' : 'WebGL 2 (WebGPU yok, yedek)') + '</b> · ' + FX.length + ' fixture';
+applyCue(P.view && P.view.autoCue != null ? P.view.autoCue : 2);
+
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+let frames = 0, t0 = performance.now();
+renderer.setAnimationLoop(() => {
+  controls.update(); Q.has('plain') ? renderer.render(scene, camera) : post.render();
+  if (window.__snap) { window.__snap = 0; window.__img = renderer.domElement.toDataURL('image/jpeg', 0.92); }
+  if (++frames === 60) { const fps = Math.round(60000 / (performance.now() - t0)); st.innerHTML = st.innerHTML.replace(/ · \d+ fps$/, '') + ' · ' + fps + ' fps'; frames = 0; t0 = performance.now(); }
+});
+window.__ready = true;
+</script>
+</body>
+</html>
